@@ -1,0 +1,10 @@
+{
+  "sessions": {
+    "demo-session-1": {
+      "user_id": "user1",
+      "role": "normal",
+      "expires_at": 1776938255.9207258,
+      "client_ip": "34.123.45.67"
+    }
+  }
+}
