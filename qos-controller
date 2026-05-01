@@ -1,0 +1,215 @@
+import json
+import os
+import time
+
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from ryu.ofproto import ofproto_v1_3
+from ryu.lib.packet import packet, ethernet, ether_types, ipv4
+
+from rbac import RBACManager
+from qos_manager import QoSManager
+from policy import RBAC_POLICY, QOS_PROFILES
+
+
+class AuthQoSController(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    def __init__(self, *args, **kwargs):
+        super(AuthQoSController, self).__init__(*args, **kwargs)
+        self.mac_to_port = {}
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.session_file = os.path.join(self.base_dir, "sessions.json")
+
+        self.rbac_manager = RBACManager(RBAC_POLICY)
+        self.qos_manager = QoSManager(QOS_PROFILES)
+
+    def _load_json_file(self, filename, default):
+        file_path = os.path.join(self.base_dir, filename)
+        try:
+            with open(file_path, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            self.logger.error("File not found: %s", filename)
+            return default
+        except Exception as e:
+            self.logger.error("Error reading %s: %s", filename, e)
+            return default
+
+        return data if isinstance(data, dict) else default
+
+    def _load_sessions(self):
+        data = self._load_json_file("sessions.json", {})
+        sessions = data.get("sessions", {})
+        if not isinstance(sessions, dict):
+            return {}
+
+        now = time.time()
+        active = {}
+
+        for session_id, meta in sessions.items():
+            try:
+                expires_at = float(meta.get("expires_at", 0))
+                if now < expires_at:
+                    active[session_id] = meta
+            except (TypeError, ValueError, AttributeError):
+                continue
+
+        return active
+
+    def _find_session_by_ip(self, ip_addr):
+        sessions = self._load_sessions()
+        for session_id, meta in sessions.items():
+            try:
+                if meta.get("client_ip") == ip_addr:
+                    return session_id, meta
+            except AttributeError:
+                continue
+        return None, None
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        self.add_flow(datapath, priority=0, match=match, actions=actions)
+
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None,
+                 hard_timeout=None, idle_timeout=None):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
+        flow_kwargs = {
+            "datapath": datapath,
+            "priority": priority,
+            "match": match,
+            "instructions": inst,
+        }
+
+        if hard_timeout is not None:
+            flow_kwargs["hard_timeout"] = hard_timeout
+        if idle_timeout is not None:
+            flow_kwargs["idle_timeout"] = idle_timeout
+        if buffer_id is not None and buffer_id != ofproto.OFP_NO_BUFFER:
+            flow_kwargs["buffer_id"] = buffer_id
+
+        mod = parser.OFPFlowMod(**flow_kwargs)
+        datapath.send_msg(mod)
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        in_port = msg.match["in_port"]
+
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocol(ethernet.ethernet)
+
+        if eth is None:
+            return
+
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP or eth.ethertype == 0x88CC:
+            return
+
+        dpid = datapath.id
+        self.mac_to_port.setdefault(dpid, {})
+
+        src_mac = eth.src
+        dst_mac = eth.dst
+        self.mac_to_port[dpid][src_mac] = in_port
+
+        # Determine output port by MAC learning
+        if dst_mac in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst_mac]
+        else:
+            out_port = ofproto.OFPP_FLOOD
+
+        # IPv4 handling
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+
+        # If not IP, do normal L2 forwarding
+        if ip_pkt is None:
+            actions = [parser.OFPActionOutput(out_port)]
+
+            if out_port != ofproto.OFPP_FLOOD:
+                match = parser.OFPMatch(
+                    in_port=in_port,
+                    eth_src=src_mac,
+                    eth_dst=dst_mac,
+                    eth_type=eth.ethertype,
+                )
+                self.add_flow(
+                    datapath=datapath,
+                    priority=1,
+                    match=match,
+                    actions=actions,
+                    buffer_id=msg.buffer_id,
+                    idle_timeout=15,
+                )
+
+            self._send_packet_out(datapath, msg, parser, ofproto, in_port, actions)
+            return
+
+        src_ip = ip_pkt.src
+        dst_ip = ip_pkt.dst
+
+        # Check session authentication
+        session_id, session_meta = self._find_session_by_ip(src_ip)
+        if session_id is None:
+            self.logger.info("DROP UNAUTHORIZED: %s -> %s", src_ip, dst_ip)
+            return
+
+        role = session_meta.get("role", "least")
+        user_id = session_meta.get("user_id", "unknown")
+        queue_id = self.qos_manager.get_queue_id(role)
+
+        self.logger.info(
+            "AUTHORIZED: session=%s user=%s role=%s src_ip=%s dst_ip=%s queue_id=%s",
+            session_id, user_id, role, src_ip, dst_ip, queue_id
+        )
+
+        # Build actions
+        actions = []
+        if out_port != ofproto.OFPP_FLOOD:
+            actions.append(parser.OFPActionSetQueue(queue_id))
+        actions.append(parser.OFPActionOutput(out_port))
+
+        # Install flow for authenticated IP traffic
+        if out_port != ofproto.OFPP_FLOOD:
+            match = parser.OFPMatch(
+                in_port=in_port,
+                eth_type=0x0800,
+                ipv4_src=src_ip,
+                ipv4_dst=dst_ip,
+                eth_src=src_mac,
+                eth_dst=dst_mac,
+            )
+            self.add_flow(
+                datapath=datapath,
+                priority=10,
+                match=match,
+                actions=actions,
+                buffer_id=msg.buffer_id,
+                hard_timeout=60,
+                idle_timeout=30,
+            )
+
+        self._send_packet_out(datapath, msg, parser, ofproto, in_port, actions)
+
+    def _send_packet_out(self, datapath, msg, parser, ofproto, in_port, actions):
+        data = None if msg.buffer_id != ofproto.OFP_NO_BUFFER else msg.data
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=data,
+        )
+        datapath.send_msg(out)
